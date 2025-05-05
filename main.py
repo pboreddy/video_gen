@@ -68,19 +68,25 @@ def run_subprocess(cmd: list[str], cwd: str | None = None, check: bool = True, l
     """Runs a subprocess command, captures output, logs, and handles errors."""
     cmd_str = ' '.join(cmd)
     logging.info(f"Running command: {cmd_str}" + (f" in {cwd}" if cwd else ""))
+
     try:
         result = subprocess.run(
-            cmd,
+            cmd, # Always pass the command list directly
             cwd=cwd,
             capture_output=True,
             text=True,
             check=check, # Let subprocess handle CalledProcessError if check is True
+            shell=False
         )
-        if log_output_on_success:
+        # Always log stderr on success if it's not empty, as it might contain warnings
+        if result.returncode == 0 and result.stderr:
+             logging.info(f"Command successful with warnings/info in stderr: {cmd_str}")
+             logging.info(f"stdout: {result.stdout}")
+             logging.info(f"stderr: {result.stderr}")
+        elif log_output_on_success:
             logging.info(f"Command successful: {cmd_str}")
             logging.info(f"stdout: {result.stdout}")
-            logging.info(f"stderr: {result.stderr}")
-        elif result.returncode != 0: # Log output if it failed but check=False
+        elif result.returncode != 0: # Log output if it failed (check=False or check=True)
              logging.warning(f"Command finished with non-zero exit code ({result.returncode}): {cmd_str}")
              logging.warning(f"stdout: {result.stdout}")
              logging.warning(f"stderr: {result.stderr}")
@@ -207,43 +213,51 @@ def generate_individual_audio_files(audio_scripts: list[str], tmpdir: str) -> li
 
 
 def concatenate_audio_files(temp_audio_paths: list[str], tmpdir: str) -> str | None:
-    """Concatenates a list of audio files using ffmpeg."""
+    """Concatenates a list of audio files using ffmpeg (concat filter method)."""
     if not temp_audio_paths:
         logging.warning("No audio paths provided for concatenation.")
         return None
 
-    logging.info(f"Concatenating {len(temp_audio_paths)} audio files...")
-    audio_list_file = os.path.join(tmpdir, "audio_list.txt")
-    full_narration_path = os.path.join(tmpdir, "full_narration.mp3")
+    valid_paths = [p for p in temp_audio_paths if os.path.exists(p)]
+    if len(valid_paths) < len(temp_audio_paths):
+        logging.warning(f"Found {len(valid_paths)} existing audio files out of {len(temp_audio_paths)} provided.")
+    if not valid_paths:
+        logging.error("No valid audio files found to concatenate.")
+        return None
+
+    num_files = len(valid_paths)
+    logging.info(f"Concatenating {num_files} audio files using concat filter...")
+    full_narration_path = os.path.join(tmpdir, "full_narration.m4a") # New filename using .m4a extension
+
     try:
-        with open(audio_list_file, 'w') as f:
-            for path in temp_audio_paths:
-                # Correctly escape paths for ffmpeg's concat demuxer format
-                # Ensure path exists before adding? Or let ffmpeg fail?
-                if not os.path.exists(path):
-                     logging.warning(f"Audio file for concatenation not found: {path}. Skipping.")
-                     continue
-                safe_path_for_concat = path.replace("'", "'\\''")
-                f.write(f"file '{safe_path_for_concat}'\\n") # Ensure newline character
+        cmd = ["ffmpeg", "-y"] # Start command
 
-        # Check if the list file actually contains any files after existence checks
-        if os.path.getsize(audio_list_file) == 0:
-            logging.warning("Audio list file is empty after checks. Cannot concatenate.")
-            return None
+        # Add each valid path as an input
+        for path in valid_paths:
+            cmd.extend(["-i", path])
 
-        concat_audio_cmd = [
-            "ffmpeg", "-y", # Overwrite output file if it exists
-            "-f", "concat", "-safe", "0",
-            "-i", audio_list_file, "-c", "copy", full_narration_path
-        ]
-        run_subprocess(concat_audio_cmd, check=True)
+        # Construct the filtergraph string
+        # e.g., "[0:a][1:a][2:a]concat=n=3:v=0:a=1[aout]"
+        filter_streams = "".join([f"[{i}:a]" for i in range(num_files)])
+        filtergraph = f"{filter_streams}concat=n={num_files}:v=0:a=1[aout]"
+
+        cmd.extend([
+            "-filter_complex", filtergraph,
+            "-map", "[aout]", # Map the filter output
+            # Choose output codec - AAC is generally robust
+            "-c:a", "aac", "-b:a", "192k",
+            full_narration_path
+        ])
+
+        logging.info(f"Running audio concatenation command: {' '.join(cmd)}")
+        run_subprocess(cmd, check=True)
         logging.info(f"Concatenated audio saved to temporary file: {full_narration_path}")
         return full_narration_path
     except (RuntimeError, FileNotFoundError, IOError) as e:
-        logging.error(f"Failed during audio concatenation: {e}", exc_info=True) # Log traceback
+        logging.error(f"Failed during audio concatenation (filter method): {e}", exc_info=True)
         return None
     except Exception as e:
-        logging.error(f"Unexpected error during audio concatenation: {e}", exc_info=True)
+        logging.error(f"Unexpected error during audio concatenation (filter method): {e}", exc_info=True)
         return None
 
 
@@ -268,65 +282,165 @@ def generate_and_concatenate_audio(audio_scripts: list[str], tmpdir: str) -> str
 
 @mcp.tool()
 def assemble_video(clip_paths: list[str], audio_paths: list[str]) -> str:
-    """Assembles video clips and merges them with pre-generated audio files."""
-    logging.info(f"assemble_video started with {len(clip_paths)} clips and {len(audio_paths)} audio files.")
+    """Merges each video clip with its corresponding audio file, then concatenates the results."""
+    logging.info(f"assemble_video started with {len(clip_paths)} clips and {len(audio_paths)} audio files for pairwise merging.")
 
     if not clip_paths:
         logging.error("No clip paths provided for assembly.")
         raise ValueError("No clip paths provided.")
 
-    has_audio_files = bool(audio_paths)
-    if has_audio_files and len(clip_paths) != len(audio_paths):
-        logging.warning(f"Mismatch between number of clips ({len(clip_paths)}) and audio files ({len(audio_paths)}). Proceeding, but lengths usually match.")
-        # Decide if this mismatch should halt execution or just proceed
-        # For now, we proceed but log a warning.
+    # If no audio is provided, just concatenate the original clips
+    if not audio_paths:
+        logging.warning("No audio paths provided. Concatenating video clips without merging audio.")
+        return concatenate_videos(clip_paths)
 
-    full_narration_path = None
-    temp_dir_for_concat = None # Keep track of temp dir if created
+    # If audio is provided, number of clips and audio files must match
+    if len(clip_paths) != len(audio_paths):
+        logging.error(f"Mismatch between number of clips ({len(clip_paths)}) and audio files ({len(audio_paths)}). Cannot perform pairwise merge.")
+        raise ValueError("Number of clips and audio files must match for pairwise merging.")
 
-    try:
-        if has_audio_files:
-            # Validate audio paths before attempting concatenation
-            valid_audio_paths = []
-            for path in audio_paths:
-                if os.path.exists(path):
-                    valid_audio_paths.append(path)
+    intermediate_clip_paths = []
+    # Use a single temporary directory for all intermediate merged clips
+    with TemporaryDirectory(prefix="intermediate_clips_") as tmpdir:
+        logging.info(f"Created temporary directory for intermediate clips: {tmpdir}")
+        try:
+            for i, (clip_path, audio_path) in enumerate(zip(clip_paths, audio_paths)):
+                logging.info(f"Merging clip {i+1}/{len(clip_paths)} ({os.path.basename(clip_path)}) with audio ({os.path.basename(audio_path)})...")
+                
+                # Validate individual paths
+                if not os.path.exists(clip_path):
+                    logging.error(f"Input video clip not found: {clip_path}")
+                    raise FileNotFoundError(f"Input video clip not found: {clip_path}")
+                if not os.path.exists(audio_path):
+                    logging.error(f"Input audio file not found: {audio_path}")
+                    raise FileNotFoundError(f"Input audio file not found: {audio_path}")
+
+                intermediate_output_path = os.path.join(tmpdir, f"intermediate_{i}.mp4")
+
+                # Probe video duration
+                try:
+                    probe_cmd = [
+                        "ffprobe", "-v", "error",
+                        "-show_entries", "format=duration",
+                        "-of", "default=noprint_wrappers=1:nokey=1",
+                        clip_path
+                    ]
+                    probe_result = run_subprocess(probe_cmd, check=True)
+                    video_duration = float(probe_result.stdout.strip())
+                    logging.info(f"Detected video duration: {video_duration:.2f} seconds")
+                except Exception as e:
+                    logging.warning(f"Could not determine video duration: {e}. Skipping audio padding.")
+                    video_duration = None
+
+                # Build ffmpeg command for merging individual pair with optional audio padding
+                if video_duration:
+                    merge_cmd = [
+                        "ffmpeg", "-y",
+                        "-i", clip_path,
+                        "-i", audio_path,
+                        "-filter_complex", f"[1:a]apad,atrim=duration={video_duration}[aud]",
+                        "-map", "0:v:0",
+                        "-map", "[aud]",
+                        "-c:v", "copy",
+                        "-c:a", "aac",
+                        "-b:a", "192k",
+                        intermediate_output_path
+                    ]
                 else:
-                    logging.warning(f"Audio file not found: {path}. Skipping.")
-            
-            if not valid_audio_paths:
-                logging.warning("No valid audio files found after checking existence. Proceeding without audio.")
-                has_audio_files = False # Force proceeding without audio
-            else:
-                # Create a temporary directory specifically for audio concatenation artifacts
-                temp_dir_for_concat = TemporaryDirectory(prefix="audio_concat_")
-                logging.info(f"Concatenating {len(valid_audio_paths)} audio files in {temp_dir_for_concat.name}")
-                full_narration_path = concatenate_audio_files(valid_audio_paths, temp_dir_for_concat.name)
-                if not full_narration_path:
-                    logging.warning("Audio concatenation failed. Proceeding without audio overlay.")
-                    has_audio_files = False # Force proceeding without audio
-                else:
-                    logging.info(f"Audio concatenation successful. Concatenated audio at: {full_narration_path}")
+                    merge_cmd = [
+                        "ffmpeg", "-y",
+                        "-i", clip_path,
+                        "-i", audio_path,
+                        "-map", "0:v:0",
+                        "-map", "1:a:0",
+                        "-c:v", "copy",
+                        "-c:a", "aac",
+                        "-b:a", "192k",
+                        intermediate_output_path
+                    ]
 
-        # Use the concatenated audio path if successful, otherwise an empty string
-        audio_path_for_merge = full_narration_path if has_audio_files and full_narration_path else ""
+                logging.info(f"Running intermediate merge command: {' '.join(merge_cmd)}")
+                run_subprocess(merge_cmd, check=True, log_output_on_success=True)
+                intermediate_clip_paths.append(intermediate_output_path)
+                logging.info(f"Intermediate clip created: {intermediate_output_path}")
+
+            # After loop, check if we successfully created intermediate clips
+            if not intermediate_clip_paths:
+                logging.error("No intermediate clips were successfully created.")
+                raise RuntimeError("Failed to create any intermediate video clips.")
+
+            # Concatenate the intermediate clips
+            logging.info(f"All intermediate clips created. Concatenating {len(intermediate_clip_paths)} clips...")
+            final_result_message = concatenate_videos(intermediate_clip_paths)
+            logging.info(f"assemble_video finished successfully.")
+            return final_result_message
         
-        if not audio_path_for_merge:
-             logging.info("Proceeding to merge/concatenate video without audio overlay.")
+        except (RuntimeError, FileNotFoundError, subprocess.CalledProcessError) as e:
+            logging.error(f"Error during pairwise merging or final concatenation: {e}", exc_info=True)
+            # Return the error message possibly generated by concatenate_videos or raise a new one
+            if isinstance(e, subprocess.CalledProcessError):
+                 return f"Tool: assemble_video, Result: Failed during processing. Error: {getattr(e, 'stderr', str(e))}"
+            else:
+                 raise RuntimeError(f"Assemble video failed: {e}") from e
+        # Temporary directory tmpdir is automatically cleaned up here
 
-        # merge_video_audio handles the actual merging/concatenation logic
-        result_message = merge_video_audio(clip_paths=clip_paths, audio_path=audio_path_for_merge)
-        logging.info(f"assemble_video finished successfully.")
-        return result_message
+def concatenate_videos(input_clip_paths: list[str]) -> str:
+    """Concatenates video clips using ffmpeg's concat demuxer. Assumes clips contain necessary streams (video, audio)."""
+    logging.info(f"concatenate_videos started with {len(input_clip_paths)} clips.")
 
-    finally:
-        # Clean up the temporary directory used for concatenation if it was created
-        if temp_dir_for_concat:
-            try:
-                temp_dir_for_concat.cleanup()
-                logging.info(f"Cleaned up temporary directory: {temp_dir_for_concat.name}")
-            except Exception as e:
-                logging.error(f"Error cleaning up temporary directory {temp_dir_for_concat.name}: {e}")
+    # Validate input clip paths
+    if not input_clip_paths:
+        raise ValueError("No clip paths provided for concatenation.")
+    for clip_path in input_clip_paths:
+        if not os.path.exists(clip_path):
+            raise FileNotFoundError(f"Input video clip not found: {clip_path}")
+
+    # Use a temporary directory for the video list file
+    with TemporaryDirectory(prefix="concat_videos_") as tmpdir:
+        logging.info(f"Created temporary directory for video concatenation list: {tmpdir}")
+        
+        # Create concat list file for video clips
+        list_file_path = os.path.join(tmpdir, "concat_list.txt")
+        with open(list_file_path, 'w') as f:
+            for clip_path in input_clip_paths:
+                # Using abspath and simple replace for safety
+                abs_clip_path = os.path.abspath(clip_path)
+                safe_clip_path = abs_clip_path.replace("'", "'\\''") # Escape single quotes
+                file_line = f"file '{safe_clip_path}'"
+                f.write(file_line + "\n") # Use standard newline
+        logging.info(f"Video concatenation list created at: {list_file_path}")
+
+        # Set up output path (in permanent static_videos)
+        final_video_filename = f"merged_video_{uuid.uuid4()}.mp4"
+        final_video_path = os.path.join(static_videos, final_video_filename)
+
+        # Build ffmpeg command - Use stream copy to preserve timestamps
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", list_file_path,
+            "-c", "copy",
+            final_video_path
+        ]
+        
+        logging.info(f"Running final concatenation command (stream copy): {' '.join(cmd)}")
+        try:
+            run_subprocess(cmd, check=True, log_output_on_success=True) 
+            logging.info(f"Final concatenated video saved to: {final_video_path}")
+        except (RuntimeError, FileNotFoundError, subprocess.CalledProcessError) as e:
+            logging.error(f"Final video concatenation failed: {e}", exc_info=True)
+            # Clean up potentially partially created output file on error
+            if os.path.exists(final_video_path):
+                try:
+                    os.remove(final_video_path)
+                    logging.info(f"Removed incomplete output file: {final_video_path}")
+                except OSError as remove_err:
+                    logging.error(f"Failed to remove incomplete output file {final_video_path}: {remove_err}")
+            return f"Tool: assemble_video, Result: Failed to concatenate video clips. Error: {getattr(e, 'stderr', str(e))}" 
+
+        # Return success message (no longer mentions audio explicitly, as it's assumed part of input clips)
+        relative_final_path = os.path.relpath(final_video_path, os.getcwd()) 
+        return f"Tool: assemble_video, Result: Final video assembled: /{relative_final_path.replace(os.sep, '/')}"
 
 @mcp.tool()
 def generate_audio(audio_script: str) -> str:
@@ -375,54 +489,6 @@ def generate_audio(audio_script: str) -> str:
     except Exception as e:
         logging.error(f"Unexpected error saving audio file: {e}", exc_info=True)
         raise RuntimeError(f"Unexpected error saving audio: {e}") from e # Re-raise after logging
-
-# @mcp.tool()
-def merge_video_audio(clip_paths: list[str], audio_path: str) -> str:
-    """Merges video clips using ffmpeg. Overlays audio if audio_path is valid."""
-    logging.info(f"merge_video_audio started with {len(clip_paths)} clips.")
-
-    # Validate input paths
-    if not clip_paths:
-        raise ValueError("No clip paths provided for merging.")
-    for clip_path in clip_paths:
-        if not os.path.exists(clip_path):
-            raise FileNotFoundError(f"Input video clip not found: {clip_path}")
-    has_audio = audio_path and os.path.exists(audio_path)
-    if not has_audio:
-        logging.warning("No valid audio path provided. Merging video without audio.")
-
-    with TemporaryDirectory(prefix="merge_") as tmpdir:
-        # Create concat list file
-        list_file_path = os.path.join(tmpdir, "concat_list.txt")
-        with open(list_file_path, 'w') as f:
-            for clip_path in clip_paths:
-                # Escape single quotes for ffmpeg concat demuxer
-                safe_clip_path = clip_path.replace("'", "'\\\\''")
-                # Construct the line and write it with a standard newline
-                file_line = f"file '{safe_clip_path}'"
-                f.write(file_line + "\n")
-
-        # Set up output path
-        final_video_filename = f"merged_video_{uuid.uuid4()}.mp4"
-        final_video_path = os.path.join(static_videos, final_video_filename)
-
-        # Build ffmpeg command
-        cmd = ["ffmpeg", "-f", "concat", "-safe", "0", "-i", list_file_path]
-        if has_audio:
-            cmd.extend([
-                "-i", audio_path,
-                "-map", "0:v:0", "-map", "1:a:0",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k", "-shortest"
-            ])
-        else:
-            cmd.extend(["-c", "copy"])
-        cmd.append(final_video_path)
-
-        # Execute merge
-        run_subprocess(cmd, check=True)
-        relative_url = f"/static/videos/{final_video_filename}"
-        return f"Final video merged: {relative_url} (Audio {'included' if has_audio else 'not included'})"
 
 if __name__ == "__main__":
     logging.info("main.py: Starting MCP server via mcp.run()")
